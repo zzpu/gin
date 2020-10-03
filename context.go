@@ -5,8 +5,12 @@
 package gin
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/protobuf/types"
+	"github.com/zzpu/kratos/pkg/ecode"
 	"io"
 	"io/ioutil"
 	"math"
@@ -15,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +49,8 @@ const abortIndex int8 = math.MaxInt8 / 2
 // Context is the most important part of gin. It allows us to pass variables between middleware,
 // manage the flow, validate the JSON of a request and render a JSON response for example.
 type Context struct {
+	context.Context
+
 	writermem responseWriter
 	Request   *http.Request
 	Writer    ResponseWriter
@@ -193,7 +200,7 @@ func (c *Context) AbortWithStatus(code int) {
 // It also sets the Content-Type as "application/json".
 func (c *Context) AbortWithStatusJSON(code int, jsonObj interface{}) {
 	c.Abort()
-	c.JSON(code, jsonObj)
+	c.JSON(jsonObj, nil)
 }
 
 // AbortWithError calls `AbortWithStatus()` and `Error()` internally.
@@ -703,6 +710,11 @@ func (c *Context) ShouldBindWith(obj interface{}, b binding.Binding) error {
 	return b.Bind(c.Request, obj)
 }
 
+// BindWith bind req arg with parser.
+func (c *Context) BindWith(obj interface{}, b binding.Binding) error {
+	return c.MustBindWith(obj, b)
+}
+
 // ShouldBindBodyWith is similar with ShouldBindWith, but it stores the request
 // body into the context, and reuse when it is called again.
 //
@@ -890,22 +902,42 @@ func (c *Context) SecureJSON(code int, obj interface{}) {
 	c.Render(code, render.SecureJSON{Prefix: c.engine.secureJSONPrefix, Data: obj})
 }
 
-// JSONP serializes the given struct as JSON into the response body.
-// It add padding to response body to request data from a server residing in a different domain than the client.
-// It also sets the Content-Type as "application/javascript".
-func (c *Context) JSONP(code int, obj interface{}) {
-	callback := c.DefaultQuery("callback", "")
-	if callback == "" {
-		c.Render(code, render.JSON{Data: obj})
-		return
+// JSONMap serializes the given map as map JSON into the response body.
+// It also sets the Content-Type as "application/json".
+func (c *Context) JSONMap(data map[string]interface{}, err error) {
+	code := http.StatusOK
+	bcode := ecode.Cause(err)
+	// TODO app allow 5xx?
+	/*
+		if bcode.Code() == -500 {
+			code = http.StatusServiceUnavailable
+		}
+	*/
+	writeStatusCode(c.Writer, bcode.Code())
+	data["code"] = bcode.Code()
+	if _, ok := data["message"]; !ok {
+		data["message"] = bcode.Message()
 	}
-	c.Render(code, render.JsonpJSON{Callback: callback, Data: obj})
+	c.Render(code, render.MapJSON(data))
 }
 
 // JSON serializes the given struct as JSON into the response body.
 // It also sets the Content-Type as "application/json".
-func (c *Context) JSON(code int, obj interface{}) {
-	c.Render(code, render.JSON{Data: obj})
+func (c *Context) JSON(data interface{}, err error) {
+	code := http.StatusOK
+	bcode := ecode.Cause(err)
+	// TODO app allow 5xx?
+	/*
+		if bcode.Code() == -500 {
+			code = http.StatusServiceUnavailable
+		}
+	*/
+	writeStatusCode(c.Writer, bcode.Code())
+	c.Render(code, render.JSON{
+		Code:    bcode.Code(),
+		Message: bcode.Message(),
+		Data:    data,
+	})
 }
 
 // AsciiJSON serializes the given struct as JSON into the response body with unicode to ASCII string.
@@ -922,8 +954,21 @@ func (c *Context) PureJSON(code int, obj interface{}) {
 
 // XML serializes the given struct as XML into the response body.
 // It also sets the Content-Type as "application/xml".
-func (c *Context) XML(code int, obj interface{}) {
-	c.Render(code, render.XML{Data: obj})
+func (c *Context) XML(data interface{}, err error) {
+	code := http.StatusOK
+	bcode := ecode.Cause(err)
+	// TODO app allow 5xx?
+	/*
+		if bcode.Code() == -500 {
+			code = http.StatusServiceUnavailable
+		}
+	*/
+	writeStatusCode(c.Writer, bcode.Code())
+	c.Render(code, render.XML{
+		Code:    bcode.Code(),
+		Message: bcode.Message(),
+		Data:    data,
+	})
 }
 
 // YAML serializes the given struct as YAML into the response body.
@@ -931,9 +976,32 @@ func (c *Context) YAML(code int, obj interface{}) {
 	c.Render(code, render.YAML{Data: obj})
 }
 
-// ProtoBuf serializes the given struct as ProtoBuf into the response body.
-func (c *Context) ProtoBuf(code int, obj interface{}) {
-	c.Render(code, render.ProtoBuf{Data: obj})
+// Protobuf serializes the given struct as PB into the response body.
+// It also sets the ContentType as "application/x-protobuf".
+func (c *Context) Protobuf(data proto.Message, err error) {
+	var (
+		bytes []byte
+	)
+
+	code := http.StatusOK
+
+	bcode := ecode.Cause(err)
+
+	any := new(types.Any)
+	if data != nil {
+		if bytes, err = proto.Marshal(data); err != nil {
+			//c.Errors = errorMsgs{err}
+			return
+		}
+		any.TypeUrl = "type.googleapis.com/" + proto.MessageName(data)
+		any.Value = bytes
+	}
+	writeStatusCode(c.Writer, bcode.Code())
+	c.Render(code, render.PB{
+		Code:    int64(bcode.Code()),
+		Message: bcode.Message(),
+		Data:    any,
+	})
 }
 
 // String writes the given string into the response body.
@@ -951,7 +1019,7 @@ func (c *Context) Redirect(code int, location string) {
 }
 
 // Data writes some data into the body stream and updates the HTTP code.
-func (c *Context) Data(code int, contentType string, data []byte) {
+func (c *Context) Data(code int, contentType string, data ...[]byte) {
 	c.Render(code, render.Data{
 		ContentType: contentType,
 		Data:        data,
@@ -1038,7 +1106,7 @@ func (c *Context) Negotiate(code int, config Negotiate) {
 	switch c.NegotiateFormat(config.Offered...) {
 	case binding.MIMEJSON:
 		data := chooseData(config.JSONData, config.Data)
-		c.JSON(code, data)
+		c.JSON(data, nil)
 
 	case binding.MIMEHTML:
 		data := chooseData(config.HTMLData, config.Data)
@@ -1046,7 +1114,7 @@ func (c *Context) Negotiate(code int, config Negotiate) {
 
 	case binding.MIMEXML:
 		data := chooseData(config.XMLData, config.Data)
-		c.XML(code, data)
+		c.XML(data, nil)
 
 	case binding.MIMEYAML:
 		data := chooseData(config.YAMLData, config.Data)
@@ -1127,4 +1195,17 @@ func (c *Context) Value(key interface{}) interface{} {
 		return val
 	}
 	return nil
+}
+
+// Bytes writes some data into the body stream and updates the HTTP code.
+func (c *Context) Bytes(code int, contentType string, data ...[]byte) {
+	c.Render(code, render.Data{
+		ContentType: contentType,
+		Data:        data,
+	})
+}
+
+func writeStatusCode(w http.ResponseWriter, ecode int) {
+	header := w.Header()
+	header.Set("kratos-status-code", strconv.FormatInt(int64(ecode), 10))
 }

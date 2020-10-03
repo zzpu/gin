@@ -5,13 +5,18 @@
 package gin
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"github.com/pkg/errors"
+	"github.com/zzpu/kratos/pkg/conf/dsn"
+	"github.com/zzpu/kratos/pkg/net/ip"
 	"html/template"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,9 +30,34 @@ import (
 const defaultMultipartMemory = 32 << 20 // 32 MB
 
 var (
+	_httpDSN       string
 	default404Body = []byte("404 page not found")
 	default405Body = []byte("405 method not allowed")
 )
+
+func init() {
+	addFlag(flag.CommandLine)
+}
+
+func addFlag(fs *flag.FlagSet) {
+	v := os.Getenv("HTTP")
+	if v == "" {
+		v = "tcp://0.0.0.0:8000/?timeout=1s"
+	}
+	fs.StringVar(&_httpDSN, "http", v, "listen http dsn, or use HTTP env variable.")
+}
+
+func parseDSN(rawdsn string) *ServerConfig {
+	conf := new(ServerConfig)
+	d, err := dsn.Parse(rawdsn)
+	if err != nil {
+		panic(errors.Wrapf(err, "gin: invalid dsn: %s", rawdsn))
+	}
+	if _, err = d.Bind(conf); err != nil {
+		panic(errors.Wrapf(err, "gin: invalid dsn: %s", rawdsn))
+	}
+	return conf
+}
 
 var defaultAppEngine bool
 
@@ -62,6 +92,11 @@ type ServerConfig struct {
 	WriteTimeout xtime.Duration `dsn:"query.writeTimeout"`
 }
 
+// MethodConfig is
+type MethodConfig struct {
+	Timeout xtime.Duration
+}
+
 // RoutesInfo defines a RouteInfo array.
 type RoutesInfo []RouteInfo
 
@@ -69,6 +104,11 @@ type RoutesInfo []RouteInfo
 // Create an instance of Engine, by using New() or Default()
 type Engine struct {
 	RouterGroup
+
+	lock sync.RWMutex
+	conf *ServerConfig
+
+	address string
 
 	// Enables automatic redirection if the current route can't be matched but a
 	// handler for the path with (without) the trailing slash exists.
@@ -129,9 +169,17 @@ type Engine struct {
 	trees            methodTrees
 	maxParams        uint16
 
-	conf *ServerConfig
+	injections []injection
+	server     atomic.Value                      // store *http.Server
+	metastore  map[string]map[string]interface{} // metastore is the path as key and the metadata of this path as value, it export via /metadata
 
-	server atomic.Value // store *http.Server
+	pcLock        sync.RWMutex
+	methodConfigs map[string]*MethodConfig
+}
+
+type injection struct {
+	pattern  *regexp.Regexp
+	handlers []HandlerFunc
 }
 
 var _ IRouter = &Engine{}
@@ -173,12 +221,74 @@ func New() *Engine {
 	return engine
 }
 
+// NewServer returns a new blank Engine instance without any middleware attached.
+func NewServer(conf *ServerConfig) *Engine {
+	if conf == nil {
+		if !flag.Parsed() {
+			fmt.Fprint(os.Stderr, "[gin] please call flag.Parse() before Init gin server, some configure may not effect.\n")
+		}
+		conf = parseDSN(_httpDSN)
+	}
+	engine := &Engine{
+		RouterGroup: RouterGroup{
+			Handlers: nil,
+			basePath: "/",
+			root:     true,
+		},
+		address:                ip.InternalIP(),
+		trees:                  make(methodTrees, 0, 9),
+		metastore:              make(map[string]map[string]interface{}),
+		methodConfigs:          make(map[string]*MethodConfig),
+		HandleMethodNotAllowed: true,
+		injections:             make([]injection, 0),
+	}
+	if err := engine.SetConfig(conf); err != nil {
+		panic(err)
+	}
+	engine.RouterGroup.engine = engine
+	// NOTE add prometheus monitor location
+	engine.addRoute("GET", "/metrics", HandlersChain{monitor()})
+	engine.addRoute("GET", "/metadata", HandlersChain{engine.metadata()})
+	engine.NoRoute(func(c *Context) {
+		c.Bytes(404, "text/plain", default404Body)
+		c.Abort()
+	})
+	engine.NoMethod(func(c *Context) {
+		c.Bytes(405, "text/plain", []byte(http.StatusText(405)))
+		c.Abort()
+	})
+	startPerf(engine)
+	return engine
+}
+
 // Default returns an Engine instance with the Logger and Recovery middleware already attached.
 func Default() *Engine {
 	debugPrintWARNINGDefault()
 	engine := New()
 	engine.Use(Logger(), Recovery())
 	return engine
+}
+
+// DefaultServer returns an Engine instance with the Recovery and Logger middleware already attached.
+func DefaultServer(conf *ServerConfig) *Engine {
+	engine := NewServer(conf)
+	engine.Use(Recovery(), Trace(), Logger())
+	return engine
+}
+
+// SetConfig is used to set the engine configuration.
+// Only the valid config will be loaded.
+func (engine *Engine) SetConfig(conf *ServerConfig) (err error) {
+	if conf.Timeout <= 0 {
+		return errors.New("gin: config timeout must greater than 0")
+	}
+	if conf.Network == "" {
+		conf.Network = "tcp"
+	}
+	engine.lock.Lock()
+	engine.conf = conf
+	engine.lock.Unlock()
+	return
 }
 
 // Start listen and serve bm engine by given DSN.
@@ -218,6 +328,12 @@ func (engine *Engine) RunServer(server *http.Server, l net.Listener) (err error)
 		return
 	}
 	return
+}
+
+func (engine *Engine) metadata() HandlerFunc {
+	return func(c *Context) {
+		c.JSON(engine.metastore, nil)
+	}
 }
 
 func (engine *Engine) allocateContext() *Context {
@@ -291,6 +407,24 @@ func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
 	engine.rebuild405Handlers()
 }
 
+// Server is used to load stored http server.
+func (engine *Engine) Server() *http.Server {
+	s, ok := engine.server.Load().(*http.Server)
+	if !ok {
+		return nil
+	}
+	return s
+}
+
+// Shutdown the http server without interrupting active connections.
+func (engine *Engine) Shutdown(ctx context.Context) error {
+	server := engine.Server()
+	if server == nil {
+		return errors.New("gin: no server")
+	}
+	return errors.WithStack(server.Shutdown(ctx))
+}
+
 // Use attaches a global middleware to the router. ie. the middleware attached though Use() will be
 // included in the handlers chain for every single request. Even 404, 405, static files...
 // For example, this is the right place for a logger or error management middleware.
@@ -299,6 +433,11 @@ func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
 	engine.rebuild404Handlers()
 	engine.rebuild405Handlers()
 	return engine
+}
+
+// Ping is used to set the general HTTP ping handler.
+func (engine *Engine) Ping(handler HandlerFunc) {
+	engine.GET("/ping", handler)
 }
 
 func (engine *Engine) rebuild404Handlers() {

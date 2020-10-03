@@ -7,6 +7,7 @@ package render
 import (
 	"bytes"
 	"fmt"
+	"github.com/pkg/errors"
 	"html/template"
 	"net/http"
 
@@ -15,8 +16,25 @@ import (
 )
 
 // JSON contains the given interface object.
+// JSON common json struct.
 type JSON struct {
-	Data interface{}
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	TTL     int         `json:"ttl"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, obj interface{}) (err error) {
+	var jsonBytes []byte
+	writeContentType(w, jsonContentType)
+	if jsonBytes, err = json.Marshal(obj); err != nil {
+		err = errors.WithStack(err)
+		return
+	}
+	if _, err = w.Write(jsonBytes); err != nil {
+		err = errors.WithStack(err)
+	}
+	return
 }
 
 // IndentedJSON contains the given interface object.
@@ -189,5 +207,18 @@ func (r PureJSON) Render(w http.ResponseWriter) error {
 
 // WriteContentType (PureJSON) writes custom ContentType.
 func (r PureJSON) WriteContentType(w http.ResponseWriter) {
+	writeContentType(w, jsonContentType)
+}
+
+// MapJSON common map json struct.
+type MapJSON map[string]interface{}
+
+// Render (MapJSON) writes data with json ContentType.
+func (m MapJSON) Render(w http.ResponseWriter) error {
+	return writeJSON(w, m)
+}
+
+// WriteContentType write json ContentType.
+func (m MapJSON) WriteContentType(w http.ResponseWriter) {
 	writeContentType(w, jsonContentType)
 }

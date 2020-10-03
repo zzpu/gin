@@ -173,7 +173,7 @@ func ErrorLoggerT(typ ErrorType) HandlerFunc {
 		c.Next()
 		errors := c.Errors.ByType(typ)
 		if len(errors) > 0 {
-			c.JSON(-1, errors)
+			c.JSON(errors, nil)
 		}
 	}
 }
