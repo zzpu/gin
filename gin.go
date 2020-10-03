@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin/internal/bytesconv"
-	"github.com/gin-gonic/gin/render"
+	"github.com/zzpu/gin/internal/bytesconv"
+	"github.com/zzpu/gin/render"
 	"github.com/zzpu/kratos/pkg/log"
 	xtime "github.com/zzpu/kratos/pkg/time"
 )
